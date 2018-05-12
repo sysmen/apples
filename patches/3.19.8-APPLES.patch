@@ -1,0 +1,819 @@
+diff -uNr linux-3.19.8-orig/arch/x86/kvm/vmx.c linux-3.19.8/arch/x86/kvm/vmx.c
+--- linux-3.19.8-orig/arch/x86/kvm/vmx.c	2018-01-16 17:39:51.828055545 -0500
++++ linux-3.19.8/arch/x86/kvm/vmx.c	2018-01-16 17:41:08.345050158 -0500
+@@ -55,6 +55,13 @@
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
++// APPLES hack code
++extern int ple_counter; // the number of PLE exits in each adjusting round; the default value is 1000; Can be tuned to large enough to assure the accurate measurement of overhad in each adjusting round
++extern int aple_debug_counter; // for debugging
++extern int aple_debug; // for debugging
++extern int aple_enable; // the switch used to enable/disable APLE component, 1 is enable and 0 is disable 
++// APPLES hack code
++
+ static const struct x86_cpu_id vmx_cpu_id[] = {
+ 	X86_FEATURE_MATCH(X86_FEATURE_VMX),
+ 	{}
+@@ -152,6 +159,7 @@
+ static int ple_window_actual_max = KVM_VMX_DEFAULT_PLE_WINDOW_MAX;
+ static int ple_window_max        = KVM_VMX_DEFAULT_PLE_WINDOW_MAX;
+ module_param(ple_window_max, int, S_IRUGO);
++EXPORT_SYMBOL_GPL(ple_window_actual_max);
+ 
+ extern const ulong vmx_return;
+ 
+@@ -5757,6 +5765,16 @@
+ 	trace_kvm_ple_window_grow(vcpu->vcpu_id, vmx->ple_window, old);
+ }
+ 
++// APPLES hack code
++static int return_ple_window(struct kvm_vcpu *vcpu)
++{
++    struct vcpu_vmx *vmx = to_vmx(vcpu);
++    int old = vmx->ple_window;
++	
++	return old;
++}
++// APPLES hack code
++
+ static void shrink_ple_window(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -5988,16 +6006,49 @@
+  * Indicate a busy-waiting vcpu in spinlock. We do not enable the PAUSE
+  * exiting, so only get here on cpu with PAUSE-Loop-Exiting.
+  */
++
++// APPLES hack code
+ static int handle_pause(struct kvm_vcpu *vcpu)
+ {
+-	if (ple_gap)
+-		grow_ple_window(vcpu);
+-
++    int cpu_id = smp_processor_id(); // current cpu's id
++    struct kvm *kvm = vcpu->kvm; // current vcpu's VM
++	if(aple_enable == 0){ // APLE component is not enabled, but we still collect overhead and inefficiency to compare with the case that APLE is enabled
++    	spin_lock(&(kvm->d_ple_lock)); // to make sure the counters are updated exclusively
++    	if(kvm->d_ple_exit_counter < ple_counter){ // it is in the begin or middle of a round
++    		if(kvm->d_ple_exit_counter == 0){ // begin of a new adjusting round
++       	    	getnstimeofday(&(kvm->d_ple_start)); // store the beginning timestamp of the new round
++       		}
++			if(kvm->d_ple_inefficiency_counter == 0){ // begin of inefficiency profiling round
++       	     	getnstimeofday(&(kvm->d_ple_inefficiency_start));
++			}
++        	getnstimeofday(&(kvm->d_ple_per_start[cpu_id])); // store the beginning timestamp of the PLE handing in current CPU
++        	kvm->d_ple_exit[cpu_id]++; // update the variable to indicate that PLE exit just happened in this CPU
++        	kvm->d_ple_exit_counter++; // update the total number of PLE exits in all CPUs in current round
++			kvm->d_ple_exit_window[cpu_id] = return_ple_window(vcpu); // 
++    	}
++    	spin_unlock(&(kvm->d_ple_lock)); // release the lock
++		if (ple_gap) // PLE is enabled
++			grow_ple_window(vcpu); // by default kvm would increase PLE window after each PLE exit if the PLE is enabled
++	}else{ // APLE component is enabled
++		spin_lock(&(kvm->ple_lock)); // hold the lock to make exclusive update
++		if(kvm->ple_exit_counter < ple_counter && vcpu->ple_window_updated == 1){ // the new ple_window has been updated to this VCPU's vmcs to work
++			if(kvm->ple_exit_counter == 0){ // begin of a new round
++				getnstimeofday(&(kvm->ple_start)); // record the timestamp
++			}
++            if(kvm->ple_inefficiency_counter == 0){ // begin of inefficiency profiling round
++                getnstimeofday(&(kvm->ple_inefficiency_start)); // store the beginning timestamp 
++            }
++			getnstimeofday(&(kvm->ple_per_start[cpu_id])); // store the beginning timestamp of the PLE handing in current CPU
++			kvm->ple_exit[cpu_id]++; // update the variable to indicate that PLE exit just happened in this CPU 
++			kvm->ple_exit_counter++; // update the total number of PLE exits in all CPUs in current round
++		}
++		spin_unlock(&(kvm->ple_lock)); // release the lock
++	}
+ 	skip_emulated_instruction(vcpu);
+ 	kvm_vcpu_on_spin(vcpu);
+-
+ 	return 1;
+ }
++// APPLES hack code
+ 
+ static int handle_nop(struct kvm_vcpu *vcpu)
+ {
+@@ -7761,6 +7812,7 @@
+ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	struct kvm *kvm = vcpu->kvm;
+ 	unsigned long debugctlmsr, cr4;
+ 
+ 	/* Record the guest's net vcpu time for enforced NMI injections. */
+@@ -7776,6 +7828,15 @@
+ 		vmx->ple_window_dirty = false;
+ 		vmcs_write32(PLE_WINDOW, vmx->ple_window);
+ 	}
++	
++	// APPLES hack code
++	if(aple_enable){	
++		vmcs_write32(PLE_WINDOW, kvm->ple_window);// when APLE is enabled, make sure that we overwrite per-VCPU PLE_window by our per-VM ple_window value
++	}
++	if(vcpu->ple_window_updated == 0){
++		vcpu->ple_window_updated = 1; // indicate that the per-VCPU ple_window has been updated and work now
++	}
++	// APPLES hack code
+ 
+ 	if (vmx->nested.sync_shadow_vmcs) {
+ 		copy_vmcs12_to_shadow(vmx);
+@@ -9298,11 +9359,16 @@
+ 	return X86EMUL_CONTINUE;
+ }
+ 
++
++// APPLES hack code	
+ static void vmx_sched_in(struct kvm_vcpu *vcpu, int cpu)
+ {
+-	if (ple_gap)
+-		shrink_ple_window(vcpu);
++	if(aple_enable == 0){
++		if (ple_gap)
++			shrink_ple_window(vcpu);
++	} // to make sure that if APLE is enabled the PLE_window would not be shrinked
+ }
++// APPLES hack code	
+ 
+ static struct kvm_x86_ops vmx_x86_ops = {
+ 	.cpu_has_kvm_support = cpu_has_kvm_support,
+diff -uNr linux-3.19.8-orig/arch/x86/kvm/x86.c linux-3.19.8/arch/x86/kvm/x86.c
+--- linux-3.19.8-orig/arch/x86/kvm/x86.c	2018-01-16 17:39:51.829055545 -0500
++++ linux-3.19.8/arch/x86/kvm/x86.c	2018-01-16 17:41:29.856048644 -0500
+@@ -18,7 +18,9 @@
+  * the COPYING file in the top-level directory.
+  *
+  */
+-
++// APPLES hack code
++#include <linux/lcm.h>
++// APPLES hack code
+ #include <linux/kvm_host.h>
+ #include "irq.h"
+ #include "mmu.h"
+@@ -72,6 +74,28 @@
+ #define emul_to_vcpu(ctxt) \
+ 	container_of(ctxt, struct kvm_vcpu, arch.emulate_ctxt)
+ 
++// APPLES hack code
++extern int ple_inefficiency_counter; // counter used to indicate the duration of inefficiency profiling; for example, we may measure the overhead and adjust the window each 1000 ple exists, but we profile the inefficiency each 1000000 ple exists.
++extern int ple_min_delta; // describe the minimal step of PLE window adjustment between rounds
++extern int ple_min_delta1; 
++extern int ple_min_delta2; 
++extern int ple_min_window; // lower bound of the PLE window
++extern int ple_max_window; // upper bound of the PLE window
++extern int aple_enable; // switch to enable/disable the APLE component
++extern int aple_debug; // for debugging
++extern int aple_debug_avg; // for debugging
++extern int ple_counter; // number of PLE exits in each adjustment round; by default is 1000, should be tuned to be large enough to assure the accurate measurement of the overhead in each round
++extern int ple_delta; // describe the step of PLE window adjustment between rounds; by default it is 20, so 20% change would be made each round
++
++unsigned long long timens_sub(struct timespec end, struct timespec start){ // tool used to compute the duration; return value is in nanosecond
++	struct timespec sub;
++	unsigned long long ns;
++	sub = timespec_sub(end, start);
++	ns = sub.tv_sec * 1000000000 + sub.tv_nsec;
++	return ns;
++}
++// APPLES hack code
++
+ /* EFER defaults:
+  * - enable syscall per default because its emulated by KVM
+  * - enable LME and LMA per default on 64 bit KVM
+@@ -6175,6 +6199,14 @@
+  */
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
++	// APPLES hack code 
++	int i, temp_delta;
++	int cpu_id = smp_processor_id();
++	struct kvm *kvm;
++	struct kvm_vcpu *ple_vcpu;
++	struct timespec now;
++	// APPLES hack code 
++
+ 	int r;
+ 	bool req_int_win = !irqchip_in_kernel(vcpu->kvm) &&
+ 		vcpu->run->request_interrupt_window;
+@@ -6308,6 +6340,123 @@
+ 		set_debugreg(vcpu->arch.dr6, 6);
+ 	}
+ 
++	// APPLES hack code
++	// Following measurement and adjustment are done everytime when the VCPU start running again 
++	if(aple_enable){ // if the APLE component is enabled
++	getnstimeofday(&now); // get current time
++	list_for_each_entry(kvm, &vm_list, vm_list){ // traverse all vms and for each VM
++		if(kvm->ple_exit[cpu_id]){ // if the PLE exit just happened in this CPU
++			spin_lock(&(kvm->ple_lock)); // let us do exclusive update now
++			kvm->ple_switch_overhead[kvm->ple_cur_round] += timens_sub(now, kvm->ple_per_start[cpu_id]); // add the VCPU switch overhead to this VM in current round
++			// usually kvm->ple_exit[cpu_id] should be 1 to indicate one time of ple exit happen before we come here
++			kvm->ple_update_counter = kvm->ple_update_counter + kvm->ple_exit[cpu_id]; // update the number of PLE exits in current round; 
++			kvm->ple_exit[cpu_id] = 0; // clean the flag before VCPU enter
++			// add (switch overhead + spinning time) caused by previous PLE exit to the inefficiency; cpufreq_get() return khz
++			kvm->inefficiency += timens_sub(now, kvm->ple_per_start[cpu_id]) + (unsigned long long)kvm->ple_window * 1000 / cpufreq_get(cpu_id);
++			kvm->ple_inefficiency_counter++; // update the counter
++            if(kvm->ple_inefficiency_counter == ple_inefficiency_counter) { // calculate the inefficiency; the code for inefficiency is only for analysis and can be removed  
++				// total overhead divided by total CPU time during the profiling
++	            kvm->inefficiency = kvm->inefficiency * 1000 / (num_online_cpus() * timens_sub(now, kvm->ple_inefficiency_start)) ;
++                if(aple_debug_avg){
++   		             printk(KERN_INFO "APLE: vm[%d] average inefficiency is %llu\n",kvm->vcpus[0]->pid->numbers[0].nr, kvm->inefficiency);
++                }
++                kvm->inefficiency = 0;// reset
++				kvm->ple_inefficiency_counter = 0;// reset
++            }
++			if(kvm->ple_update_counter == ple_counter){ // one epoch/round finished, compute overhead for current round
++				// add total switch and spinning overhead
++				kvm->ple_overhead[kvm->ple_cur_round] = kvm->ple_switch_overhead[kvm->ple_cur_round] +	ple_counter * (unsigned long long)kvm->ple_window * 1000 / cpufreq_get(cpu_id);
++				kvm->ple_epoch[kvm->ple_cur_round] = timens_sub(now, kvm->ple_start) * num_online_cpus(); // duration of current epoch/round
++	            if(aple_debug){
++   		             printk(KERN_INFO "raw data: switch_overhead[%d]  is %llu epoch is %llu\n", kvm->ple_cur_round, kvm->ple_overhead[kvm->ple_cur_round], kvm->ple_epoch[kvm->ple_cur_round]);
++   		         }
++	            kvm->ple_overhead[kvm->ple_cur_round] = kvm->ple_overhead[kvm->ple_cur_round] * 1000 / kvm->ple_epoch[kvm->ple_cur_round];// compute inefficiency
++   		         if(aple_debug){
++   		             printk(KERN_INFO "vm[%d] inefficiency[%d] is %llu ple_window is %llu\n",kvm->vcpus[0]->pid->numbers[0].nr, kvm->ple_cur_round, kvm->ple_overhead[kvm->ple_cur_round], kvm->ple_window);
++       		     }
++				kvm->ple_cur_round = (kvm->ple_cur_round + 1) % 3;// update round index for next round
++				if(kvm->ple_cur_round ==0 ){
++					// three rounds are finished, time to compare to set a new initial ple window by comparing the inefficiency; 
++					// [0] is with initial window, [1] is with bigger window, [2] is with smaller window
++					//max = lcm(kvm->ple_epoch[0], lcm(kvm->ple_epoch[1], kvm->ple_epoch[2]));
++					temp_delta = max(ple_min_delta, (int)kvm->ple_cur_window * ple_delta / 100); // if ple_delta = 20, then the change of window would be 20%
++					if(kvm->ple_overhead[1] < kvm->ple_overhead[2] && kvm->ple_overhead[1] < kvm->ple_overhead[0]){// let's reduce the window
++						kvm->ple_window = max(ple_min_window, (int)kvm->ple_cur_window - temp_delta);// lower bound is 4096
++					} else if(kvm->ple_overhead[2] < kvm->ple_overhead[1] && kvm->ple_overhead[2] < kvm->ple_overhead[0]){// let's increase the window
++                    	kvm->ple_window = min(ple_max_window, (int)kvm->ple_cur_window + temp_delta);// upper bound is ple_man_window
++					} else {
++						kvm->ple_window = kvm->ple_cur_window;//keep the window as the initial one
++					}
++					kvm->ple_cur_window = kvm->ple_window;// save the initial window for the new three rounds adjustment phase
++					kvm->ple_switch_overhead[0] = 0; //reset switch overhead
++					kvm->ple_switch_overhead[1] = 0;
++					kvm->ple_switch_overhead[2] = 0;
++				} else if(kvm->ple_cur_round == 1){// let's reduce the window to see how the overhead change
++					temp_delta = max(ple_min_delta, (int)kvm->ple_cur_window * ple_delta / 100);
++					kvm->ple_window = max(ple_min_window, (int)kvm->ple_cur_window - temp_delta);
++				} else {// let's increase the window to see the change of overhead
++					temp_delta = max(ple_min_delta, (int)kvm->ple_cur_window * ple_delta / 100);
++                    kvm->ple_window = min(ple_max_window, (int)kvm->ple_cur_window + temp_delta);	
++				}
++				kvm_for_each_vcpu(i, ple_vcpu, kvm) {
++					ple_vcpu->ple_window_updated = 0;// make sure all this vm's VCPUs would be update in vmx_vcpu_run
++				}
++				kvm->ple_exit_counter = 0;
++				kvm->ple_update_counter = 0;
++			}
++			spin_unlock(&(kvm->ple_lock));
++		}
++	  }
++	} else { // for default setting; APLE is not enabled; these codes are just for analysis, can be removed
++		getnstimeofday(&now);
++    	list_for_each_entry(kvm, &vm_list, vm_list){
++        	if(kvm->d_ple_exit[cpu_id]){
++            	spin_lock(&(kvm->d_ple_lock));
++            	// ple exit happend before
++            	// update overhead to its kvm
++            	kvm->d_ple_overhead += timens_sub(now, kvm->d_ple_per_start[cpu_id]) + ((unsigned long long)kvm->d_ple_exit_window[cpu_id] * 1000 / cpufreq_get(cpu_id));
++				kvm->d_avg_ple_window += (unsigned long long)kvm->d_ple_exit_window[cpu_id];
++            	// reset flag
++            	kvm->d_ple_update_counter = kvm->d_ple_update_counter + kvm->d_ple_exit[cpu_id];
++            	kvm->d_ple_exit[cpu_id] = 0;
++            	// add to inefficiency
++            	kvm->d_inefficiency += timens_sub(now, kvm->d_ple_per_start[cpu_id]) + (unsigned long long)kvm->d_ple_exit_window[cpu_id] * 1000 / cpufreq_get(cpu_id);
++            	kvm->d_ple_inefficiency_counter++;
++            	if(kvm->d_ple_inefficiency_counter == ple_inefficiency_counter) {
++                	kvm->d_inefficiency = kvm->d_inefficiency * 1000 / (num_online_cpus() * timens_sub(now, kvm->d_ple_inefficiency_start)) ;
++                	if(aple_debug_avg){
++                     	printk(KERN_INFO "DEFAULT: vm[%d] average inefficiency is %llu\n",kvm->vcpus[0]->pid->numbers[0].nr, kvm->d_inefficiency);
++                	}
++                	// reset 
++                	kvm->d_inefficiency = 0;
++                	kvm->d_ple_inefficiency_counter = 0;
++            	}
++                if(aple_debug){
++             //       printk(KERN_INFO "DEFAULT:switch_overhead[%d] is %llu exit window is %d start is %ld now is %ld\n", kvm->d_ple_update_counter, timens_sub(now, kvm->d_ple_per_start[cpu_id]) + ((unsigned long long)kvm->d_ple_exit_window[cpu_id] * 10 / 24), kvm->d_ple_exit_window[cpu_id], kvm->d_ple_per_start[cpu_id].tv_sec*1000000000+ kvm->d_ple_per_start[cpu_id].tv_nsec, now.tv_sec*1000000000+now.tv_nsec);
++                }
++            	if(kvm->d_ple_update_counter == ple_counter){
++                	// one epoch finished
++                	kvm->d_ple_epoch = timens_sub(now, kvm->d_ple_start) * num_online_cpus();
++                	if(aple_debug){
++                     	printk(KERN_INFO "DEFAULT:raw data: total_overhead is %llu epoch is %llu\n", kvm->d_ple_overhead, kvm->d_ple_epoch);
++                 	}
++                	// compute inefficiency
++                	kvm->d_ple_overhead = kvm->d_ple_overhead * 1000 / kvm->d_ple_epoch;
++                 	if(aple_debug){
++                   		  printk(KERN_INFO "DEFAULT: vm[%d] inefficiency is %llu ple_window is %llu\n",kvm->vcpus[0]->pid->numbers[0].nr, kvm->d_ple_overhead, kvm->d_avg_ple_window / ple_counter);
++                 	}
++				// reset
++				kvm->d_avg_ple_window = 0;
++				kvm->d_ple_overhead = 0;	
++				kvm->d_ple_update_counter = 0;
++				kvm->d_ple_exit_counter = 0;
++			}
++			spin_unlock(&(kvm->d_ple_lock));
++		 }
++	  }
++	}
++	// APPLES hack code
++
+ 	trace_kvm_entry(vcpu->vcpu_id);
+ 	kvm_x86_ops->run(vcpu);
+ 
+diff -uNr linux-3.19.8-orig/include/linux/kvm_host.h linux-3.19.8/include/linux/kvm_host.h
+--- linux-3.19.8-orig/include/linux/kvm_host.h	2018-01-16 17:39:52.132055523 -0500
++++ linux-3.19.8/include/linux/kvm_host.h	2018-01-16 17:42:44.726043374 -0500
+@@ -229,7 +229,14 @@
+ };
+ 
+ struct kvm_vcpu {
++	// APPLES hack code
++	struct timespec preempted_time;
++	int ple_window_updated;
++	int pre_yielded;
++	int cur_yielded;
++	int yielding;
+ 	struct kvm *kvm;
++	// APPLES hack code
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	struct preempt_notifier preempt_notifier;
+ #endif
+@@ -359,6 +366,42 @@
+ };
+ 
+ struct kvm {
++	// APPLES hack code
++	// for analysis
++	unsigned long long d_avg_ple_window;
++    unsigned long long d_inefficiency;
++	int d_ple_inefficiency_counter;
++    int d_epoch_counter;
++    int d_ple_exit[256];
++    int d_ple_exit_window[256];
++    struct timespec d_ple_per_start[256];
++    int d_ple_exit_counter;
++    int d_ple_update_counter;
++    unsigned long long d_ple_epoch;
++    unsigned long long d_ple_overhead;
++    struct timespec d_ple_start;
++    struct timespec d_ple_inefficiency_start;
++    spinlock_t d_ple_lock;
++
++	// for APLE
++	unsigned long long inefficiency;
++	int ple_inefficiency_counter;
++	int epoch_counter;
++	int ple_exit[256];
++	struct timespec ple_per_start[256];
++	int ple_exit_counter; 
++	int ple_update_counter; 
++	unsigned long long ple_switch_overhead[3];
++	unsigned long long ple_epoch[3];
++	unsigned long long ple_overhead[3];
++	struct timespec ple_start;
++    struct timespec ple_inefficiency_start;
++	unsigned long long  ple_window;
++	unsigned long long  ple_cur_window;
++	spinlock_t ple_lock;
++	int ple_cur_round;
++	// APPLES hack code
++
+ 	spinlock_t mmu_lock;
+ 	struct mutex slots_lock;
+ 	struct mm_struct *mm; /* userspace tied to this vm */
+diff -uNr linux-3.19.8-orig/kernel/sched/core.c linux-3.19.8/kernel/sched/core.c
+--- linux-3.19.8-orig/kernel/sched/core.c	2018-01-16 17:39:52.407055504 -0500
++++ linux-3.19.8/kernel/sched/core.c	2018-01-16 17:43:13.326041360 -0500
+@@ -90,6 +90,47 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+ 
++// APPLES hack code
++int aple_enable = 0;
++module_param(aple_enable, int, 0664);
++EXPORT_SYMBOL_GPL(aple_enable);
++int aple_debug = 0;
++module_param(aple_debug, int, 0664);
++EXPORT_SYMBOL_GPL(aple_debug);
++int aple_debug_avg = 0;
++module_param(aple_debug_avg, int, 0664);
++EXPORT_SYMBOL_GPL(aple_debug_avg);
++int aple_debug_counter = 0;
++module_param(aple_debug_counter, int, 0664);
++EXPORT_SYMBOL_GPL(aple_debug_counter);
++
++int ple_inefficiency_counter = 1000000;
++module_param(ple_inefficiency_counter, int, 0664);
++EXPORT_SYMBOL_GPL(ple_inefficiency_counter);
++int ple_counter = 1000;
++module_param(ple_counter, int, 0664);
++EXPORT_SYMBOL_GPL(ple_counter);
++int ple_delta = 20;
++module_param(ple_delta, int, 0664);
++EXPORT_SYMBOL_GPL(ple_delta);
++int ple_min_delta = 1024;
++module_param(ple_min_delta, int, 0664);
++EXPORT_SYMBOL_GPL(ple_min_delta);
++int ple_min_delta1 = 2;
++module_param(ple_min_delta1, int, 0664);
++EXPORT_SYMBOL_GPL(ple_min_delta1);
++int ple_min_window = 4096;
++module_param(ple_min_window, int, 0664);
++EXPORT_SYMBOL_GPL(ple_min_window);
++int ple_max_window = 1000000; // tuned parameters; max allowed spinning time is around 0.4 ms when cpu is 2.4GHZ
++module_param(ple_max_window, int, 0664);
++EXPORT_SYMBOL_GPL(ple_max_window);
++int ple_min_delta2 = 2;
++module_param(ple_min_delta2, int, 0664);
++EXPORT_SYMBOL_GPL(ple_min_delta2);
++//APPLES hack code
++
++
+ void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
+ {
+ 	unsigned long delta;
+@@ -8085,6 +8126,7 @@
+ 	return (u64) scale_load_down(tg->shares);
+ }
+ 
++
+ #ifdef CONFIG_CFS_BANDWIDTH
+ static DEFINE_MUTEX(cfs_constraints_mutex);
+ 
+diff -uNr linux-3.19.8-orig/virt/kvm/kvm_main.c linux-3.19.8/virt/kvm/kvm_main.c
+--- linux-3.19.8-orig/virt/kvm/kvm_main.c	2018-01-16 17:39:52.412055504 -0500
++++ linux-3.19.8/virt/kvm/kvm_main.c	2018-01-16 17:43:36.148039754 -0500
+@@ -66,6 +66,19 @@
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
++// APPLES hack code
++int select_order1 = 0;
++module_param(select_order1, int, 0664);
++EXPORT_SYMBOL_GPL(select_order1);
++int select_order2 = 0;
++module_param(select_order2, int, 0664);
++EXPORT_SYMBOL_GPL(select_order2);
++int mple_enable = 0; // 0 disable; 1 enable; 2 first schedule VCPU preempted by PLE; option 2 is only used for analysis
++module_param(mple_enable, int, 0664);
++EXPORT_SYMBOL_GPL(mple_enable);
++// APPLES hack code
++
++
+ /*
+  * Ordering of locks:
+  *
+@@ -208,6 +221,9 @@
+ 	int r;
+ 
+ 	mutex_init(&vcpu->mutex);
++	// APPLES hack code
++	vcpu->ple_window_updated = 1;
++	// APPLES hack code
+ 	vcpu->cpu = -1;
+ 	vcpu->kvm = kvm;
+ 	vcpu->vcpu_id = id;
+@@ -489,6 +505,40 @@
+ 	}
+ 
+ 	spin_lock_init(&kvm->mmu_lock);
++	// APPLES hack code
++	kvm->d_avg_ple_window = 0;
++    kvm->d_inefficiency = 0;
++    kvm->d_epoch_counter = 0;
++    for(i = 0; i < num_online_cpus(); i++){
++        kvm->d_ple_exit[i] = 0;
++    }
++    kvm->d_ple_exit_counter = 0;
++    kvm->d_ple_update_counter = 0;
++    spin_lock_init(&kvm->d_ple_lock);
++    kvm->d_ple_overhead = 0;
++    kvm->d_ple_epoch = 0;
++
++	kvm->inefficiency = 0;
++	kvm->epoch_counter = 0;
++	for(i = 0; i < num_online_cpus(); i++){
++		kvm->ple_exit[i] = 0;		
++	}
++	kvm->ple_exit_counter = 0;
++	kvm->ple_update_counter = 0;
++	kvm->ple_cur_round = 0;
++	kvm->ple_window = 4096; // initial value of the per-VM window
++	spin_lock_init(&kvm->ple_lock);
++	kvm->ple_overhead[0] = 0;
++	kvm->ple_overhead[1] = 0;
++	kvm->ple_overhead[2] = 0;
++	kvm->ple_switch_overhead[0] = 0;
++	kvm->ple_switch_overhead[1] = 0;
++	kvm->ple_switch_overhead[2] = 0;
++	kvm->ple_epoch[0] = 0;
++	kvm->ple_epoch[1] = 0;
++	kvm->ple_epoch[2] = 0;
++	// APPLES hack code
++
+ 	kvm->mm = current->mm;
+ 	atomic_inc(&kvm->mm->mm_count);
+ 	kvm_eventfd_init(kvm);
+@@ -1778,6 +1828,8 @@
+ 	put_cpu();
+ }
+ EXPORT_SYMBOL_GPL(kvm_vcpu_kick);
++
++
+ #endif /* !CONFIG_S390 */
+ 
+ int kvm_vcpu_yield_to(struct kvm_vcpu *target)
+@@ -1839,6 +1891,113 @@
+ #endif
+ }
+ 
++// APPLES hack code
++// this function is used to orgnize the list of VCPUs in the ascending order
++void my_insert1(struct kvm_vcpu *vcpu, struct kvm_vcpu **candidate_list, int len)
++{
++	if(select_order1 == 0){
++		// by default we use ascending order
++		long temp = 1000000000 * vcpu->preempted_time.tv_sec + vcpu->preempted_time.tv_nsec; 
++		int i, j;
++
++		if(len == 0){
++			candidate_list[len] = vcpu;
++		}else{
++			for(i = 0; i < len; i++){
++				if(temp < candidate_list[i]->preempted_time.tv_sec * 1000000000 + candidate_list[i]->preempted_time.tv_nsec){
++					for(j = len; j > i; j--){
++						candidate_list[j] = candidate_list[j-1]; 
++					}	
++					candidate_list[i] = vcpu;
++					break;
++				}
++				if(i == len - 1)
++					candidate_list[len] = vcpu;	
++			}
++		}
++	}
++	if(select_order1 == 1){
++		// random; this is for analysis and can be removed
++		candidate_list[len] = vcpu;	
++	}	
++	if(select_order1 == 2){
++		// descending order; this is for analysis and can be removed
++        long temp = 1000000000 * vcpu->preempted_time.tv_sec + vcpu->preempted_time.tv_nsec;
++        int i, j;
++
++        if(len == 0){
++            candidate_list[len] = vcpu;
++        }else{
++            for(i = 0; i < len; i++){
++                if(temp > candidate_list[i]->preempted_time.tv_sec * 1000000000 + candidate_list[i]->preempted_time.tv_nsec){
++                    for(j = len; j > i; j--){
++                        candidate_list[j] = candidate_list[j-1];
++                    }
++                    candidate_list[i] = vcpu;
++                    break;
++                }
++                if(i == len - 1)
++                    candidate_list[len] = vcpu;
++            }
++        }
++	
++	}
++}
++
++// this function is used to orgnize the list of VCPUs in the descending order
++void my_insert2(struct kvm_vcpu *vcpu, struct kvm_vcpu **candidate_list, int len)
++{
++	if(select_order2 == 0) {
++	// by default we use descending order
++    	long temp = 1000000000 * vcpu->preempted_time.tv_sec + vcpu->preempted_time.tv_nsec;
++		int i, j;
++
++		if(len == 0){
++			candidate_list[len] = vcpu;
++		}else{
++    		for(i = 0; i < len; i++){
++       			if(temp > candidate_list[i]->preempted_time.tv_sec * 1000000000 + candidate_list[i]->preempted_time.tv_nsec){
++           			for(j = len; j > i; j--){
++               		 	candidate_list[j] = candidate_list[j-1];  
++            		}
++           		 	candidate_list[i] = vcpu;
++       		     	break;
++       		 	}
++     	 	if(i == len - 1)
++       	     	candidate_list[len] = vcpu;  
++    		}
++		}
++	}
++	
++	if(select_order2 == 1){
++		// random; this is for analysis and can be removed
++		candidate_list[len] = vcpu;
++	}
++
++    if(select_order2 == 2) {
++    // ascending order; this is for analysis and can be removed
++        long temp = 1000000000 * vcpu->preempted_time.tv_sec + vcpu->preempted_time.tv_nsec;
++        int i, j;
++
++        if(len == 0){
++            candidate_list[len] = vcpu;
++        }else{
++            for(i = 0; i < len; i++){
++                if(temp < candidate_list[i]->preempted_time.tv_sec * 1000000000 + candidate_list[i]->preempted_time.tv_nsec){
++                    for(j = len; j > i; j--){
++                        candidate_list[j] = candidate_list[j-1];
++                    }
++                    candidate_list[i] = vcpu;
++                    break;
++                }
++            if(i == len - 1)
++                candidate_list[len] = vcpu;  
++            }
++        }
++    }
++}
++// APPLES hack code
++
+ void kvm_vcpu_on_spin(struct kvm_vcpu *me)
+ {
+ 	struct kvm *kvm = me->kvm;
+@@ -1849,6 +2008,15 @@
+ 	int pass;
+ 	int i;
+ 
++	int my_yielded = -1;
++	// APPLES hack code
++	int len_list1 = 0; // used to group resource-waiter
++	int len_list2 = 0; // used to group lock-waiter
++	struct kvm_vcpu *candidate_list1[256];
++	struct kvm_vcpu *candidate_list2[256];
++	struct kvm_vcpu *candidate;
++	// APPLES hack code
++
+ 	kvm_vcpu_set_in_spin_loop(me, true);
+ 	/*
+ 	 * We boost the priority of a VCPU that is runnable but not
+@@ -1857,33 +2025,122 @@
+ 	 * VCPU is holding the lock that we need and will release it.
+ 	 * We approximate round-robin by starting at the last boosted VCPU.
+ 	 */
+-	for (pass = 0; pass < 2 && !yielded && try; pass++) {
+-		kvm_for_each_vcpu(i, vcpu, kvm) {
+-			if (!pass && i <= last_boosted_vcpu) {
+-				i = last_boosted_vcpu;
+-				continue;
+-			} else if (pass && i > last_boosted_vcpu)
+-				break;
+-			if (!ACCESS_ONCE(vcpu->preempted))
+-				continue;
+-			if (vcpu == me)
+-				continue;
+-			if (waitqueue_active(&vcpu->wq) && !kvm_arch_vcpu_runnable(vcpu))
+-				continue;
+-			if (!kvm_vcpu_eligible_for_directed_yield(vcpu))
+-				continue;
+-
+-			yielded = kvm_vcpu_yield_to(vcpu);
+-			if (yielded > 0) {
+-				kvm->last_boosted_vcpu = i;
+-				break;
+-			} else if (yielded < 0) {
+-				try--;
+-				if (!try)
+-					break;
++	// APPLES hack code
++	if(mple_enable == 0){
++		// kvm default
++		for (pass = 0; pass < 2 && !yielded && try; pass++) {
++       		kvm_for_each_vcpu(i, vcpu, kvm) {
++               	if (!pass && i <= last_boosted_vcpu) {
++                       	i = last_boosted_vcpu;
++                       	continue;
++               	} else if (pass && i > last_boosted_vcpu)
++                       	break;
++               	if (!ACCESS_ONCE(vcpu->preempted))
++                       	continue;
++               	if (vcpu == me)
++                       	continue;
++               	if (waitqueue_active(&vcpu->wq) && !kvm_arch_vcpu_runnable(vcpu))
++                       	continue;
++               	if (!kvm_vcpu_eligible_for_directed_yield(vcpu))
++                       	continue;
++
++               	yielded = kvm_vcpu_yield_to(vcpu);
++               	if (yielded > 0) {
++                       	kvm->last_boosted_vcpu = i;
++                       	break;
++               	} else if (yielded < 0) {
++                       	try--;
++                       	if (!try)
++                               	break;
++               	}
++       		}
++		}
++	} 
++	if(mple_enable == 1){
++		// mple/HVS enabled
++        kvm_for_each_vcpu(i, vcpu, kvm) {
++        	if (!ACCESS_ONCE(vcpu->preempted))
++           		continue;
++            if (vcpu == me)
++            	continue;
++            if (waitqueue_active(&vcpu->wq) && !kvm_arch_vcpu_runnable(vcpu))
++            	continue;
++			if (!vcpu->spin_loop.in_spin_loop){
++				// put into resource-waiter list
++				my_insert1(vcpu, candidate_list1, len_list1);
++				len_list1++;
++			}else{
++				// put into lock-waiter list
++		 		my_insert2(vcpu, candidate_list2, len_list2);
++                len_list2++;	
+ 			}
+ 		}
++		// round 1; check the candidate in the resource-waiter list
++        while(len_list1 > 0){
++            candidate = candidate_list1[len_list1 - 1];
++            len_list1--;
++			if(candidate->yielding == 1)
++				// if someone else already yielded to this candidate, then we move to the next one
++				continue;
++            my_yielded = kvm_vcpu_yield_to(candidate); // successed
++			candidate->yielding = 1;
++            if(my_yielded > 0){
++				// failed
++                break;
++			}
++        }
++        if(my_yielded <= 0){
++            // round 2; We cannot find any candidate in the resource-waiter list, so we now look at the lock-waiter list
++            while(len_list2 > 0){
++                candidate = candidate_list2[len_list2-1];
++                len_list2--;
++                my_yielded = kvm_vcpu_yield_to(candidate);
++                if(my_yielded > 0)
++                    break;
++            }
++        }
++	}
++	if(mple_enable == 2){
++        // mple enabled, but schedule lock-waiter first; this is for analysis and can be removed later
++        kvm_for_each_vcpu(i, vcpu, kvm) {
++            if (!ACCESS_ONCE(vcpu->preempted))
++                continue;
++            if (vcpu == me)
++                continue;
++            if (waitqueue_active(&vcpu->wq) && !kvm_arch_vcpu_runnable(vcpu))
++                continue;
++            if (!vcpu->spin_loop.in_spin_loop){
++                my_insert1(vcpu, candidate_list1, len_list1);
++                len_list1++;
++            }else{
++                my_insert2(vcpu, candidate_list2, len_list2);
++                len_list2++;
++            }
++        }
++        // round 1
++        while(len_list2 > 0){
++            candidate = candidate_list2[len_list2 - 1];
++            len_list2--;
++            my_yielded = kvm_vcpu_yield_to(candidate);
++            if(my_yielded > 0){
++                break;
++            }
++        }
++        if(my_yielded <= 0){
++            // round 2
++            while(len_list1 > 0){
++                candidate = candidate_list1[len_list1-1];
++                len_list1--;
++            	if(candidate->yielding == 1)
++                	continue;
++                my_yielded = kvm_vcpu_yield_to(candidate);
++            	candidate->yielding = 1;
++                if(my_yielded > 0)
++                    break;
++            }
++        }	
+ 	}
++	// APPLES hack code
+ 	kvm_vcpu_set_in_spin_loop(me, false);
+ 
+ 	/* Ensure vcpu is not eligible during next spinloop */
+@@ -3196,6 +3453,8 @@
+ 	if (vcpu->preempted)
+ 		vcpu->preempted = false;
+ 
++	vcpu->yielding = 0;
++
+ 	kvm_arch_sched_in(vcpu, cpu);
+ 
+ 	kvm_arch_vcpu_load(vcpu, cpu);
+@@ -3205,6 +3464,8 @@
+ 			  struct task_struct *next)
+ {
+ 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
++		
++	getnstimeofday(&vcpu->preempted_time);
+ 
+ 	if (current->state == TASK_RUNNING)
+ 		vcpu->preempted = true;
